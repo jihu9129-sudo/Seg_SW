@@ -245,11 +245,8 @@ st.image(crop_display, caption="크롭 영역", use_container_width=True)
 
 # ======================= Downloads =====================
 st.subheader("다운로드")
-st.download_button("마스크", to_png_bytes(mask_up), "mask.png")
-st.download_button("오버레이", to_png_bytes(overlay), "overlay.png")
-st.download_button("윤곽선", to_png_bytes(contour_img), "contour.png")
-st.download_button("Heatmap", to_png_bytes(heat_up), "heatmap.png")
 st.download_button("크롭 이미지", to_png_bytes(crop_display), "crop.png")
+
 
 
 
