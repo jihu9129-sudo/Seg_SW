@@ -1,4 +1,4 @@
-# app_safe_full.py
+# app_safe_pipeline.py
 import streamlit as st
 import torch
 import torch.nn as nn
@@ -11,8 +11,7 @@ from skimage.morphology import remove_small_objects
 from scipy.ndimage import binary_fill_holes
 
 # ======================= 설정 ==========================
-IMG_SIZE = 256        # 모델 입력 크기
-PREVIEW_SIZE = 256    # 화면 출력용
+IMG_SIZE = 256
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ======================= 유틸리티 ======================
@@ -65,13 +64,14 @@ class UNetImproved(nn.Module):
         return self.output(u2)
 
 # ======================= 모델 로드 =====================
-st.title("피부 병변 분할 SW (UNet 기반)")
+st.title("피부 병변 분할 SW (UNet 안전 버전)")
 
 uploaded_model = st.file_uploader("모델 파일 업로드 (.pth)", type=["pth"])
+
 @st.cache_resource
 def load_model(uploaded_file):
     model = UNetImproved().to(device)
-    if uploaded_file is not None:
+    if uploaded_file:
         state = torch.load(uploaded_file, map_location=device)
         model.load_state_dict(state, strict=False)
         st.success("모델 로드 완료")
@@ -105,25 +105,7 @@ def gaussian_blur(img, ksize=3):
 def adjust_brightness_contrast(img, alpha=1.0, beta=0):
     return np.clip(img*alpha + beta,0,255).astype(np.uint8)
 
-@st.cache_data
-def preprocess_image(img, hair, clahe, clip, tile, blur, ksize, bc, alpha, beta):
-    img_proc = img.copy()
-    if hair: img_proc = hair_removal(img_proc)
-    if clahe: img_proc = clahe_equalization(img_proc, clip, tile)
-    if blur: img_proc = gaussian_blur(img_proc, ksize)
-    if bc: img_proc = adjust_brightness_contrast(img_proc, alpha, beta)
-    return img_proc
-
 # ======================= 후처리 =======================
-def auto_crop(image, mask, pad=10):
-    coords = np.column_stack(np.where(mask>0))
-    if len(coords)==0: return image
-    y_min, x_min = coords.min(axis=0)
-    y_max, x_max = coords.max(axis=0)
-    y_min, x_min = max(y_min-pad,0), max(x_min-pad,0)
-    y_max, x_max = min(y_max+pad,image.shape[0]), min(x_max+pad,image.shape[1])
-    return image[y_min:y_max, x_min:x_max]
-
 def largest_component(mask):
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
     if num_labels<=1: return mask
@@ -139,16 +121,16 @@ def smooth_mask(mask, median_k=9, min_size=200):
     m_bool = remove_small_objects(m>0,min_size)
     return m_bool.astype(np.uint8)
 
-def apply_heatmap(prob_map):
-    p = (prob_map*255).astype(np.uint8)
-    heat = cv2.applyColorMap(p, cv2.COLORMAP_JET)
-    return cv2.cvtColor(heat, cv2.COLOR_BGR2RGB)
-
 def draw_contour(img, mask, color=(255,0,0), thick=2):
     cnts,_ = cv2.findContours((mask>0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     img_copy = img.copy()
     cv2.drawContours(img_copy, cnts, -1, color, thick)
     return img_copy
+
+def apply_heatmap(prob_map):
+    p = (prob_map*255).astype(np.uint8)
+    heat = cv2.applyColorMap(p, cv2.COLORMAP_JET)
+    return cv2.cvtColor(heat, cv2.COLOR_BGR2RGB)
 
 # ======================= Streamlit UI ===================
 uploaded = st.file_uploader("이미지 업로드", type=["png","jpg","jpeg"])
@@ -160,76 +142,79 @@ pil = Image.open(uploaded).convert("RGB")
 img_orig = np.array(pil)
 h_orig, w_orig = img_orig.shape[:2]
 
+# 화면용 전처리
 st.subheader("전처리 옵션")
-apply_hair = st.checkbox("털 제거",False)
-apply_clahe = st.checkbox("CLAHE 적용",False)
+apply_hair = st.checkbox("털 제거", False)
+apply_clahe = st.checkbox("CLAHE 적용", False)
 clahe_clip = st.slider("Clip",1.0,10.0,2.0,disabled=not apply_clahe)
 clahe_tile = st.slider("Tile",4,16,8,disabled=not apply_clahe)
-apply_blur = st.checkbox("Gaussian Blur",False)
+apply_blur = st.checkbox("Gaussian Blur", False)
 blur_ksize = st.slider("Kernel Size",1,21,3,disabled=not apply_blur)
-apply_bc = st.checkbox("밝기/대비 조정",False)
+apply_bc = st.checkbox("밝기/대비 조정", False)
 alpha_bc = st.slider("Contrast α",0.5,3.0,1.0,disabled=not apply_bc)
 beta_bc = st.slider("Brightness β",-100,100,0,disabled=not apply_bc)
 
-# 전처리 캐싱
-img_proc = preprocess_image(img_orig, apply_hair, apply_clahe, clahe_clip, clahe_tile,
-                            apply_blur, blur_ksize, apply_bc, alpha_bc, beta_bc)
+def preprocess_for_display(img):
+    img_proc = img.copy()
+    if apply_hair: img_proc = hair_removal(img_proc)
+    if apply_clahe: img_proc = clahe_equalization(img_proc, clahe_clip, clahe_tile)
+    if apply_blur: img_proc = gaussian_blur(img_proc, blur_ksize)
+    if apply_bc: img_proc = adjust_brightness_contrast(img_proc, alpha_bc, beta_bc)
+    return img_proc
 
-# ======================= 모델 추론 =====================
-img_resized = cv2.resize(img_proc,(IMG_SIZE,IMG_SIZE))
+img_proc = preprocess_for_display(img_orig)
 
+# ======================= 모델 추론 (GPU 1회만) ===================
 @st.cache_data
-def predict_mask(img_array):
-    x = transforms.ToTensor()(img_array).unsqueeze(0).to(device)
+def model_inference(img):
+    img_resized = cv2.resize(img,(IMG_SIZE,IMG_SIZE))
+    x = transforms.ToTensor()(img_resized).unsqueeze(0).to(device)
     with torch.no_grad():
         out = model(x)
         prob = torch.sigmoid(out).squeeze().cpu().numpy()
     return prob
 
-prob = predict_mask(img_resized)
+prob = model_inference(img_orig)  # 항상 원본 기반, 슬라이더 변경 시 재추론 X
 
-# ======================= 후처리 =======================
+# ======================= 후처리 및 시각화 (CPU) ===================
 st.subheader("분할 임계값")
 th = st.slider("Segmentation Threshold",0.0,1.0,0.5)
-base_mask = (prob>th).astype(np.uint8)
+mask_base = (prob>th).astype(np.uint8)
 
 st.subheader("후처리 옵션")
 remove_small = st.slider("잡음 완화",0,5000,200)
 smooth_k = st.slider("Smoothing",0,9,0)
 apply_largest = st.checkbox("가장 큰 병변만 유지",False)
 
-# 후처리 캐싱
-@st.cache_data
-def process_mask(base_mask, smooth_k, remove_small, apply_largest):
-    mask_bin = base_mask.copy()
+def process_mask(mask):
+    mask_bin = mask.copy()
     if apply_largest: mask_bin = largest_component(mask_bin)
     if smooth_k>0: mask_bin = smooth_mask(mask_bin, median_k=smooth_k if smooth_k%2==1 else smooth_k+1, min_size=remove_small)
     return mask_bin
 
-mask_bin = process_mask(base_mask, smooth_k, remove_small, apply_largest)
+mask_bin = process_mask(mask_base)
 mask_up = cv2.resize((mask_bin*255).astype(np.uint8),(w_orig,h_orig), interpolation=cv2.INTER_NEAREST)
 mask_up_bin = (mask_up>0).astype(np.uint8)
 
-# ======================= Overlay / Contour / Heatmap ===================
+# Overlay / Contour / Heatmap
 st.subheader("오버레이 설정")
 color_hex = st.color_picker("색상","#FF0000")
 r,g,b = ImageColor.getcolor(color_hex,"RGB")
 alpha_overlay = st.slider("투명도",0.0,1.0,0.4)
 
-@st.cache_data
-def generate_overlay(img, mask, color, alpha):
+def generate_overlay(img, mask):
     overlay = img.copy()
-    overlay[mask>0] = color
-    overlay = (img*(1-alpha) + overlay*alpha).astype(np.uint8)
+    overlay[mask>0] = (r,g,b)
+    overlay = (img*(1-alpha_overlay)+overlay*alpha_overlay).astype(np.uint8)
     return overlay
 
-overlay = generate_overlay(img_proc, mask_up_bin, (r,g,b), alpha_overlay)
+overlay = generate_overlay(img_proc, mask_up_bin)
 contour_img = draw_contour(img_proc.copy(), mask_up_bin, color=(r,g,b))
 heat_up = cv2.resize(apply_heatmap(prob),(w_orig,h_orig), interpolation=cv2.INTER_LINEAR)
 
 # ======================= Display =====================
 c1,c2,c3 = st.columns(3)
-c1.image(img_proc, caption="원본", use_container_width=True)
+c1.image(img_proc, caption="전처리 이미지", use_container_width=True)
 c2.image(np.stack([mask_up]*3,axis=-1), caption="마스크", use_container_width=True)
 c3.image(overlay, caption="오버레이", use_container_width=True)
 
@@ -241,22 +226,21 @@ cc2.image(heat_up, caption="Heatmap", use_container_width=True)
 st.subheader("크롭 이미지")
 crop_overlay_on = st.checkbox("크롭 오버레이 적용", False)
 crop_contour_on = st.checkbox("크롭 윤곽선 적용", False)
-crop_img = auto_crop(img_proc, mask_up_bin, pad=10)
-mask_crop = auto_crop(mask_up_bin, mask_up_bin, pad=10)
 
-@st.cache_data
-def generate_crop(crop_img, mask_crop, overlay_on, contour_on, color, alpha):
-    crop_display = crop_img.copy()
-    if overlay_on:
-        tmp = crop_display.copy()
-        tmp[mask_crop>0] = color
-        tmp = (crop_img*(1-alpha)+tmp*alpha).astype(np.uint8)
-        crop_display = tmp
-    if contour_on:
-        crop_display = draw_contour(crop_display, mask_crop, color=color)
-    return crop_display
+def generate_crop(crop_img, mask_crop):
+    display = crop_img.copy()
+    if crop_overlay_on:
+        tmp = display.copy()
+        tmp[mask_crop>0] = (r,g,b)
+        tmp = (crop_img*(1-alpha_overlay)+tmp*alpha_overlay).astype(np.uint8)
+        display = tmp
+    if crop_contour_on:
+        display = draw_contour(display, mask_crop, color=(r,g,b))
+    return display
 
-crop_display = generate_crop(crop_img, mask_crop, crop_overlay_on, crop_contour_on, (r,g,b), alpha_overlay)
+crop_img = mask_up_bin  # crop mask
+mask_crop = mask_up_bin
+crop_display = generate_crop(img_proc, mask_crop)
 st.image(crop_display, caption="크롭 영역", use_container_width=True)
 
 # ======================= Downloads =====================
@@ -266,4 +250,5 @@ st.download_button("오버레이", to_png_bytes(overlay), "overlay.png")
 st.download_button("윤곽선", to_png_bytes(contour_img), "contour.png")
 st.download_button("Heatmap", to_png_bytes(heat_up), "heatmap.png")
 st.download_button("크롭 이미지", to_png_bytes(crop_display), "crop.png")
+
 
