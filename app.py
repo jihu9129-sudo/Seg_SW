@@ -12,7 +12,7 @@ from scipy.ndimage import binary_fill_holes
 
 # ======================= 설정 ==========================
 IMG_SIZE = 256           # 모델 입력 사이즈
-PREVIEW_SIZE = 512       # 화면 출력용 축소
+PREVIEW_SIZE = 128       # 화면 출력용 축소
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ======================= 유틸리티 =======================
@@ -249,5 +249,6 @@ st.download_button("오버레이", to_png_bytes(overlay), "overlay.png")
 st.download_button("윤곽선", to_png_bytes(contour_img), "contour.png")
 st.download_button("Heatmap", to_png_bytes(heat_up), "heatmap.png")
 st.download_button("크롭 이미지", to_png_bytes(crop_display), "crop.png")
+
 
 #streamlit run C:\Users\PC\PycharmProjects\PythonProject1\.venv\app.py
