@@ -243,9 +243,7 @@ mask_crop = mask_up_bin
 crop_display = generate_crop(img_proc, mask_crop)
 st.image(crop_display, caption="크롭 영역", use_container_width=True)
 
-# ======================= Downloads =====================
-st.subheader("다운로드")
-st.download_button("크롭 이미지", to_png_bytes(crop_display), "crop.png")
+
 
 
 
