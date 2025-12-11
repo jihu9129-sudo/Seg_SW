@@ -1,3 +1,4 @@
+# app_safe_pipeline.py
 import streamlit as st
 import torch
 import torch.nn as nn
@@ -6,29 +7,24 @@ from PIL import Image, ImageColor
 import numpy as np
 import cv2
 from io import BytesIO
-import sys
-
 from skimage.morphology import remove_small_objects
 from scipy.ndimage import binary_fill_holes
-import matplotlib.cm as cm
 
-# ======================= 털 제거 함수 추가 ==========================
-def remove_hairs(img):
-    """
-    img: RGB numpy (H, W, 3)
-    return: hair-removed RGB numpy
-    """
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17, 17))
-    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+# ======================= 설정 ==========================
+IMG_SIZE = 256
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    _, thresh = cv2.threshold(blackhat, 10, 255, cv2.THRESH_BINARY)
-    thresh = cv2.dilate(thresh, np.ones((3,3), np.uint8), iterations=1)
+# ======================= 유틸리티 ======================
+def to_png_bytes(img):
+    if img.ndim == 2:
+        pil = Image.fromarray(img.astype(np.uint8), mode="L")
+    else:
+        pil = Image.fromarray(img.astype(np.uint8))
+    buf = BytesIO()
+    pil.save(buf, format="PNG")
+    return buf.getvalue()
 
-    clean = cv2.inpaint(img, thresh, 3, cv2.INPAINT_TELEA)
-    return clean
-
-# ======================= UNetImproved ==========================
+# ======================= UNetImproved ==================
 class ResidualConv(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
@@ -38,11 +34,8 @@ class ResidualConv(nn.Module):
         self.conv2 = nn.Conv2d(out_c, out_c, 3, padding=1)
         self.bn2 = nn.BatchNorm2d(out_c)
         self.shortcut = nn.Conv2d(in_c, out_c, 1) if in_c != out_c else nn.Identity()
-
     def forward(self, x):
-        return self.relu(
-            self.bn2(self.conv2(self.relu(self.bn1(self.conv1(x))))) + self.shortcut(x)
-        )
+        return self.relu(self.bn2(self.conv2(self.relu(self.bn1(self.conv1(x))))) + self.shortcut(x))
 
 class UNetImproved(nn.Module):
     def __init__(self):
@@ -57,7 +50,6 @@ class UNetImproved(nn.Module):
         self.up3 = ResidualConv(256+128,128)
         self.up2 = ResidualConv(128+64,64)
         self.output = nn.Conv2d(64,1,1)
-
     def forward(self, x):
         x1 = self.down1(x)
         x2 = self.down2(self.pool(x1))
@@ -71,169 +63,183 @@ class UNetImproved(nn.Module):
         u2 = self.up2(torch.cat([u2, x1], dim=1))
         return self.output(u2)
 
-# ======================= 설정 ==========================
-MODEL_PATH = "final_model.pth"
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-IMG_SIZE = 256
+# ======================= 모델 로드 =====================
+st.title("피부 병변 분할 SW (UNet 안전 버전)")
+
+uploaded_model = st.file_uploader("모델 파일 업로드 (.pth)", type=["pth"])
 
 @st.cache_resource
-def load_model():
-    m = UNetImproved().to(device)
-    m.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-    m.eval()
-    return m
+def load_model(uploaded_file):
+    model = UNetImproved().to(device)
+    if uploaded_file:
+        state = torch.load(uploaded_file, map_location=device)
+        model.load_state_dict(state, strict=False)
+        st.success("모델 로드 완료")
+    else:
+        st.info("모델을 업로드해주세요")
+    model.eval()
+    return model
 
-# ======================= 후처리 ==========================
-def postprocess(mask, open_k=0, close_k=0, fill=False, remove_small_val=0):
-    _, mask = cv2.threshold(mask, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if open_k > 0:
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((open_k, open_k), np.uint8))
-    if close_k > 0:
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((close_k, close_k), np.uint8))
-    if fill:
-        mask = binary_fill_holes(mask > 0).astype(np.uint8) * 255
-    if remove_small_val > 0:
-        temp = remove_small_objects(mask > 0, remove_small_val)
-        mask = (temp.astype(np.uint8) * 255)
-    return mask
+model = load_model(uploaded_model)
 
+# ======================= 전처리 =======================
+def hair_removal(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (17,17))
+    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+    _, thresh = cv2.threshold(blackhat, 10, 255, cv2.THRESH_BINARY)
+    thresh = cv2.GaussianBlur(thresh, (3,3), 0)
+    return cv2.inpaint(img, thresh, 1, cv2.INPAINT_TELEA)
+
+def clahe_equalization(img, clip=2.0, tile=8):
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+    l,a,b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile,tile))
+    l = clahe.apply(l)
+    return cv2.cvtColor(cv2.merge([l,a,b]), cv2.COLOR_LAB2RGB)
+
+def gaussian_blur(img, ksize=3):
+    if ksize%2==0: ksize+=1
+    return cv2.GaussianBlur(img,(ksize,ksize),0)
+
+def adjust_brightness_contrast(img, alpha=1.0, beta=0):
+    return np.clip(img*alpha + beta,0,255).astype(np.uint8)
+
+# ======================= 후처리 =======================
 def largest_component(mask):
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    if num_labels <= 1:
-        return mask
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
+    if num_labels<=1: return mask
     areas = stats[1:, cv2.CC_STAT_AREA]
-    largest_idx = 1 + int(np.argmax(areas))
-    mask_largest = (labels == largest_idx).astype(np.uint8) * 255
-    return mask_largest
+    largest_label = np.argmax(areas)+1
+    return (labels==largest_label).astype(np.uint8)
 
-def auto_crop(img, mask, pad=10):
-    ys, xs = np.where(mask > 0)
-    if len(xs) == 0:
-        return img
-    x1, x2 = max(xs.min()-pad,0), min(xs.max()+pad, img.shape[1])
-    y1, y2 = max(ys.min()-pad,0), min(ys.max()+pad, img.shape[0])
-    return img[y1:y2, x1:x2]
+def smooth_mask(mask, median_k=9, min_size=200):
+    m = (mask*255).astype(np.uint8)
+    if median_k%2==0: median_k+=1
+    m = cv2.medianBlur(m,max(3,median_k))
+    m = binary_fill_holes(m>0).astype(np.uint8)*255
+    m_bool = remove_small_objects(m>0,min_size)
+    return m_bool.astype(np.uint8)
 
-def mask_to_transparent_png(mask):
-    h, w = mask.shape
-    rgba = np.zeros((h, w, 4), dtype=np.uint8)
-    rgba[..., 3] = mask
-    rgba[..., 0:3][mask>0] = 255
-    _, buf = cv2.imencode('.png', rgba)
-    return buf.tobytes()
+def draw_contour(img, mask, color=(255,0,0), thick=2):
+    cnts,_ = cv2.findContours((mask>0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    img_copy = img.copy()
+    cv2.drawContours(img_copy, cnts, -1, color, thick)
+    return img_copy
 
-# ======================= 메인 UI ==========================
-st.title("피부 병변 분할 - 확장 기능 포함")
+def apply_heatmap(prob_map):
+    p = (prob_map*255).astype(np.uint8)
+    heat = cv2.applyColorMap(p, cv2.COLORMAP_JET)
+    return cv2.cvtColor(heat, cv2.COLOR_BGR2RGB)
 
+# ======================= Streamlit UI ===================
 uploaded = st.file_uploader("이미지 업로드", type=["png","jpg","jpeg"])
+if not uploaded:
+    st.info("이미지를 업로드하세요.")
+    st.stop()
 
-if uploaded:
-    img = Image.open(uploaded).convert("RGB")
-    orig_w, orig_h = img.size
-    img_np_orig = np.array(img)
+pil = Image.open(uploaded).convert("RGB")
+img_orig = np.array(pil)
+h_orig, w_orig = img_orig.shape[:2]
 
-    # =================== 털 제거 UI 추가 ===================
-    st.subheader("전처리 옵션")
-    apply_hair = st.checkbox("털 제거 (DullRazor)", False)
+# 화면용 전처리
+st.subheader("전처리 옵션")
+apply_hair = st.checkbox("털 제거", False)
+apply_clahe = st.checkbox("CLAHE 적용", False)
+clahe_clip = st.slider("Clip",1.0,10.0,2.0,disabled=not apply_clahe)
+clahe_tile = st.slider("Tile",4,16,8,disabled=not apply_clahe)
+apply_blur = st.checkbox("Gaussian Blur", False)
+blur_ksize = st.slider("Kernel Size",1,21,3,disabled=not apply_blur)
+apply_bc = st.checkbox("밝기/대비 조정", False)
+alpha_bc = st.slider("Contrast α",0.5,3.0,1.0,disabled=not apply_bc)
+beta_bc = st.slider("Brightness β",-100,100,0,disabled=not apply_bc)
 
-    if apply_hair:
-        img_np_orig = remove_hairs(img_np_orig)
+def preprocess_for_display(img):
+    img_proc = img.copy()
+    if apply_hair: img_proc = hair_removal(img_proc)
+    if apply_clahe: img_proc = clahe_equalization(img_proc, clahe_clip, clahe_tile)
+    if apply_blur: img_proc = gaussian_blur(img_proc, blur_ksize)
+    if apply_bc: img_proc = adjust_brightness_contrast(img_proc, alpha_bc, beta_bc)
+    return img_proc
 
-    # =================== 모델 입력 준비 ===================
-    img_resized = Image.fromarray(img_np_orig).resize((IMG_SIZE, IMG_SIZE))
-    img_np_resized = np.array(img_resized)
+img_proc = preprocess_for_display(img_orig)
 
-    model = load_model()
+# ======================= 모델 추론 (GPU 1회만) ===================
+@st.cache_data
+def model_inference(img):
+    img_resized = cv2.resize(img,(IMG_SIZE,IMG_SIZE))
     x = transforms.ToTensor()(img_resized).unsqueeze(0).to(device)
-
     with torch.no_grad():
-        pred_t = model(x)
-    pred = torch.sigmoid(pred_t).squeeze().cpu().numpy()
+        out = model(x)
+        prob = torch.sigmoid(out).squeeze().cpu().numpy()
+    return prob
 
-    # ================= Prediction 옵션 =================
-    st.subheader("Prediction 옵션")
-    th = st.slider("Prediction Threshold", 0.0, 1.0, 0.5)
-    base_mask = (pred > th).astype(np.uint8) * 255
+prob = model_inference(img_orig)  # 항상 원본 기반, 슬라이더 변경 시 재추론 X
 
-    # ================ 후처리 옵션 =================
-    st.subheader("후처리 옵션")
-    open_k = st.slider("Open kernel", 0, 31, 0)
-    close_k = st.slider("Close kernel", 0, 31, 0)
-    fill_holes = st.checkbox("Fill Holes", False)
-    remove_small = st.slider("Remove small objects", 0, 5000, 0)
+# ======================= 후처리 및 시각화 (CPU) ===================
+st.subheader("분할 임계값")
+th = st.slider("Segmentation Threshold",0.0,1.0,0.5)
+mask_base = (prob>th).astype(np.uint8)
 
-    apply_largest = st.checkbox("가장 큰 병변만 유지하기 (Largest Component)", False)
-    smooth_k = st.slider("Smoothing 강도 (Gaussian kernel radius)", 0, 25, 0)
+st.subheader("후처리 옵션")
+remove_small = st.slider("잡음 완화",0,5000,200)
+smooth_k = st.slider("Smoothing",0,9,0)
+apply_largest = st.checkbox("가장 큰 병변만 유지",False)
 
-    mask = postprocess(base_mask.copy(), open_k=open_k, close_k=close_k,
-                       fill=fill_holes, remove_small_val=remove_small)
+def process_mask(mask):
+    mask_bin = mask.copy()
+    if apply_largest: mask_bin = largest_component(mask_bin)
+    if smooth_k>0: mask_bin = smooth_mask(mask_bin, median_k=smooth_k if smooth_k%2==1 else smooth_k+1, min_size=remove_small)
+    return mask_bin
 
-    if apply_largest:
-        mask = largest_component(mask)
+mask_bin = process_mask(mask_base)
+mask_up = cv2.resize((mask_bin*255).astype(np.uint8),(w_orig,h_orig), interpolation=cv2.INTER_NEAREST)
+mask_up_bin = (mask_up>0).astype(np.uint8)
 
-    if smooth_k > 0:
-        ksize = smooth_k * 2 + 1
-        blur = cv2.GaussianBlur(mask, (ksize, ksize), 0)
-        _, mask = cv2.threshold(blur, 127, 255, cv2.THRESH_BINARY)
+# Overlay / Contour / Heatmap
+st.subheader("오버레이 설정")
+color_hex = st.color_picker("색상","#FF0000")
+r,g,b = ImageColor.getcolor(color_hex,"RGB")
+alpha_overlay = st.slider("투명도",0.0,1.0,0.4)
 
-    # ================ 오버레이 설정 =================
-    st.subheader("오버레이 설정")
-    color = st.color_picker("오버레이 색상", "#FF0000")
-    r, g, b = ImageColor.getcolor(color, "RGB")
-    alpha = st.slider("오버레이 투명도", 0.0, 1.0, 0.4)
+def generate_overlay(img, mask):
+    overlay = img.copy()
+    overlay[mask>0] = (r,g,b)
+    overlay = (img*(1-alpha_overlay)+overlay*alpha_overlay).astype(np.uint8)
+    return overlay
 
-    # resize mask to original size
-    mask_up = cv2.resize(mask, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+overlay = generate_overlay(img_proc, mask_up_bin)
+contour_img = draw_contour(img_proc.copy(), mask_up_bin, color=(r,g,b))
+heat_up = cv2.resize(apply_heatmap(prob),(w_orig,h_orig), interpolation=cv2.INTER_LINEAR)
 
-    # overlay
-    overlay_up = img_np_orig.copy()
-    overlay_up[mask_up > 0] = [r, g, b]
-    overlay_up = (img_np_orig * (1 - alpha) + overlay_up * alpha).astype(np.uint8)
+# ======================= Display =====================
+c1,c2,c3 = st.columns(3)
+c1.image(img_proc, caption="전처리 이미지", use_container_width=True)
+c2.image(np.stack([mask_up]*3,axis=-1), caption="마스크", use_container_width=True)
+c3.image(overlay, caption="오버레이", use_container_width=True)
 
-    # contour
-    contours_up = cv2.findContours(mask_up, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
-    contour_img = img_np_orig.copy()
-    cv2.drawContours(contour_img, contours_up, -1, (r, g, b), 2)
+cc1,cc2 = st.columns(2)
+cc1.image(contour_img, caption="윤곽선", use_container_width=True)
+cc2.image(heat_up, caption="Heatmap", use_container_width=True)
 
-    contour_overlay = overlay_up.copy()
-    cv2.drawContours(contour_overlay, contours_up, -1, (r, g, b), 2)
+# ======================= Cropping =====================
+st.subheader("크롭 이미지")
+crop_overlay_on = st.checkbox("크롭 오버레이 적용", False)
+crop_contour_on = st.checkbox("크롭 윤곽선 적용", False)
 
-    # heatmap
-    heat = (cm.jet(pred)[...,:3] * 255).astype(np.uint8)
-    heat_up = cv2.resize(heat, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+def generate_crop(crop_img, mask_crop):
+    display = crop_img.copy()
+    if crop_overlay_on:
+        tmp = display.copy()
+        tmp[mask_crop>0] = (r,g,b)
+        tmp = (crop_img*(1-alpha_overlay)+tmp*alpha_overlay).astype(np.uint8)
+        display = tmp
+    if crop_contour_on:
+        display = draw_contour(display, mask_crop, color=(r,g,b))
+    return display
 
-    # crop
-    crop_img = auto_crop(img_np_orig, mask_up, pad=10)
-
-    # ================= 출력 =================
-    st.subheader("결과 (원본 해상도)")
-    c1, c2, c3 = st.columns(3)
-    c1.image(img_np_orig, caption="원본 (Original)")
-    c2.image(mask_up, caption="마스크 (원본 크기)")
-    c3.image(overlay_up, caption="오버레이 (원본 크기)")
-
-    st.subheader("윤곽선 / 합성")
-    cc1, cc2 = st.columns(2)
-    cc1.image(contour_img, caption="윤곽선 (Contour)")
-    cc2.image(contour_overlay, caption="오버레이 + 윤곽선")
-
-    st.subheader("Heatmap (모델 신뢰도)")
-    st.image(heat_up, caption="Prediction Heatmap")
-
-    st.subheader("자동 크롭 (병변만)")
-    st.image(crop_img, caption="Cropped Lesion")
-
-    st.subheader("Before / After 비교")
-    w = orig_w
-    slider_pos = st.slider("슬라이더 위치 (가로)", 0, w, w//2)
-    before_after = img_np_orig.copy()
-    before_after[:, :slider_pos] = img_np_orig[:, :slider_pos]
-    before_after[:, slider_pos:] = overlay_up[:, slider_pos:]
-    st.image(before_after, caption="Before(left) / After(right)")
-
-   
-
-
-
-
+crop_img = mask_up_bin  # crop mask
+mask_crop = mask_up_bin
+crop_display = generate_crop(img_proc, mask_crop)
+st.image(crop_display, caption="크롭 영역", use_container_width=True)
 
