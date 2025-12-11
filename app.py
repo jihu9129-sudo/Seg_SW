@@ -231,50 +231,7 @@ if uploaded:
     before_after[:, slider_pos:] = overlay_up[:, slider_pos:]
     st.image(before_after, caption="Before(left) / After(right)")
 
-    # ================= 다운로드 기능 =================
-    st.subheader("다운로드")
-
-    def to_png_bytes(image_np):
-        _, buf = cv2.imencode('.png', image_np)
-        return buf.tobytes()
-
-    overlay_bytes = to_png_bytes(overlay_up)
-    st.download_button("오버레이 다운로드 (PNG)", overlay_bytes, "overlay.png")
-
-    _, buf_mask = cv2.imencode(".png", mask_up)
-    st.download_button("마스크 다운로드 (PNG)", buf_mask.tobytes(), "mask.png")
-
-    contour_bytes = to_png_bytes(contour_img)
-    st.download_button("윤곽선 다운로드 (PNG)", contour_bytes, "contour.png")
-
-    contour_overlay_bytes = to_png_bytes(contour_overlay)
-    st.download_button("경계선+오버레이 다운로드 (PNG)", contour_overlay_bytes, "contour_overlay.png")
-
-    transparent_mask_bytes = mask_to_transparent_png(mask_up)
-    st.download_button("투명 배경 마스크 다운로드 (PNG)", transparent_mask_bytes, "mask_transparent.png")
-
-    heat_bytes = to_png_bytes(heat_up)
-    st.download_button("Heatmap 다운로드 (PNG)", heat_bytes, "heatmap.png")
-
-    _, buf_crop = cv2.imencode(".png", crop_img)
-    st.download_button("크롭된 병변 다운로드 (PNG)", buf_crop.tobytes(), "crop.png")
-
-    # 전체 스크립트 다운로드
-    st.subheader("앱 소스 코드 다운로드")
-    try:
-        script_path = sys.argv[0]
-        with open(script_path, 'r', encoding='utf-8') as f:
-            script_content = f.read()
-    except:
-        script_content = "# Unable to read script."
-
-    st.download_button("전체 스크립트 다운로드 (.py)",
-                      data=script_content,
-                      file_name="app.py",
-                      mime="text/x-python")
-
-else:
-    st.info("이미지를 업로드하세요.")
+   
 
 
 
