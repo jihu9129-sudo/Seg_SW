@@ -64,7 +64,7 @@ class UNetImproved(nn.Module):
         return self.output(u2)
 
 # ======================= 모델 로드 =====================
-st.title("피부 병변 분할 SW (UNet 안전 버전)")
+st.title("피부 병변 분할 SW (UNet 기반)")
 
 uploaded_model = st.file_uploader("모델 파일 업로드 (.pth)", type=["pth"])
 
@@ -242,4 +242,5 @@ crop_img = mask_up_bin  # crop mask
 mask_crop = mask_up_bin
 crop_display = generate_crop(img_proc, mask_crop)
 st.image(crop_display, caption="크롭 영역", use_container_width=True)
+
 
