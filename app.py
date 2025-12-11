@@ -64,7 +64,7 @@ class UNetImproved(nn.Module):
         return self.output(u2)
 
 # ======================= 모델 로드 =====================
-st.title("피부 병변 분할 SW (UNet 안전 버전)")
+st.title("피부 병변 분할 SW (UNet 기반)")
 
 uploaded_model = st.file_uploader("모델 파일 업로드 (.pth)", type=["pth"])
 
@@ -250,5 +250,6 @@ st.download_button("오버레이", to_png_bytes(overlay), "overlay.png")
 st.download_button("윤곽선", to_png_bytes(contour_img), "contour.png")
 st.download_button("Heatmap", to_png_bytes(heat_up), "heatmap.png")
 st.download_button("크롭 이미지", to_png_bytes(crop_display), "crop.png")
+
 
 
